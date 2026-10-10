@@ -1,0 +1,189 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: JalRakshak - an AI operations agent for campus water. Lambda, API Gateway, DynamoDB, EventBridge, SNS and Bedrock (via Strands Agents).
+
+Parameters:
+  AgentMode:
+    Type: String
+    Default: local
+    AllowedValues: [local, bedrock]
+    Description: local = rule-based planner. bedrock = Strands agent driven by Claude on Bedrock (falls back to rules if the model call fails).
+  BedrockModelId:
+    Type: String
+    Default: ""
+    Description: Model or inference-profile ID exactly as listed in the Bedrock console. Only used when AgentMode is bedrock.
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Optional. Email address to receive staff alerts through SNS.
+  SimSpeedup:
+    Type: String
+    Default: "30"
+    Description: Simulated minutes per real minute. 30 makes a leak visible within seconds.
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Globals:
+  Function:
+    Runtime: python3.11
+    MemorySize: 256
+    Layers:
+      - !Ref CoreLayer
+    Environment:
+      Variables:
+        STORE: dynamodb
+        AGENT_MODE: !Ref AgentMode
+        BEDROCK_MODEL_ID: !Ref BedrockModelId
+        AGENT_FUNCTION_NAME: !Sub "${AWS::StackName}-agent"
+        BUILDINGS_TABLE: !Ref BuildingsTable
+        READINGS_TABLE: !Ref ReadingsTable
+        INCIDENTS_TABLE: !Ref IncidentsTable
+        EVENTS_TABLE: !Ref EventsTable
+        ALERT_TOPIC_ARN: !Ref AlertTopic
+        SIM_SPEEDUP: !Ref SimSpeedup
+
+Resources:
+
+  # ---------- shared code ----------
+  CoreLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub "${AWS::StackName}-core"
+      Description: Simulator, detector, agent tools and router shared by every function
+      ContentUri: layers/core/
+      CompatibleRuntimes: [python3.11, python3.12]
+      RetentionPolicy: Delete
+
+  # ---------- storage ----------
+  BuildingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: building_id, AttributeType: S}
+      KeySchema:
+        - {AttributeName: building_id, KeyType: HASH}
+
+  ReadingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: building_id, AttributeType: S}
+        - {AttributeName: ts, AttributeType: N}
+      KeySchema:
+        - {AttributeName: building_id, KeyType: HASH}
+        - {AttributeName: ts, KeyType: RANGE}
+      TimeToLiveSpecification:
+        AttributeName: expires
+        Enabled: true
+
+  IncidentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: incident_id, AttributeType: S}
+      KeySchema:
+        - {AttributeName: incident_id, KeyType: HASH}
+
+  EventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: event_id, AttributeType: S}
+      KeySchema:
+        - {AttributeName: event_id, KeyType: HASH}
+
+  # ---------- alerts ----------
+  AlertTopic:
+    Type: AWS::SNS::Topic
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ---------- API ----------
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins: ["*"]
+        AllowMethods: [GET, POST, OPTIONS]
+        AllowHeaders: ["*"]
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Every HTTP route. Advances the simulation on each request and runs the detector.
+      CodeUri: functions/api/
+      Handler: app.handler
+      Timeout: 20
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref BuildingsTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref ReadingsTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref IncidentsTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref EventsTable}
+        - LambdaInvokePolicy: {FunctionName: !Sub "${AWS::StackName}-agent"}
+      Events:
+        Any:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /{proxy+}
+            Method: ANY
+
+  # ---------- monitoring heartbeat (EventBridge) ----------
+  HeartbeatFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Every minute, advance the simulation and run the detector even when nobody has the dashboard open.
+      CodeUri: functions/heartbeat/
+      Handler: app.handler
+      Timeout: 30
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref BuildingsTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref ReadingsTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref IncidentsTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref EventsTable}
+        - LambdaInvokePolicy: {FunctionName: !Sub "${AWS::StackName}-agent"}
+      Events:
+        Tick:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 minute)
+
+  # ---------- the agent ----------
+  AgentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Investigates one incident end to end (Strands Agents on Bedrock, or the rule-based planner).
+      FunctionName: !Sub "${AWS::StackName}-agent"
+      CodeUri: functions/agent/
+      Handler: app.handler
+      Timeout: 300
+      MemorySize: 512
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref BuildingsTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref ReadingsTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref IncidentsTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref EventsTable}
+        - SNSPublishMessagePolicy: {TopicName: !GetAtt AlertTopic.TopicName}
+        - Statement:
+            - Effect: Allow
+              Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+              Resource: "*"
+
+Outputs:
+  ApiUrl:
+    Description: Base URL of the API. Put this in the frontend as NEXT_PUBLIC_API_BASE_URL.
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+  AlertTopicArn:
+    Description: SNS topic that receives staff alerts
+    Value: !Ref AlertTopic

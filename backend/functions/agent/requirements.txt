@@ -1,0 +1,3 @@
+# Empty on purpose: the default AgentMode=local needs nothing beyond the Lambda runtime.
+# To let Claude drive the agent through Bedrock, replace this file's content with
+# requirements-strands.txt (see the README) and rebuild.

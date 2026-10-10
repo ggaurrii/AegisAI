@@ -1,22 +1,25 @@
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+import type { CampusState, HistoryPoint, Incident, ScenarioKind } from "./types";
 
-export async function fetchApi<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
-  const role = typeof window !== 'undefined' ? localStorage.getItem('aquaops_role') || 'manager' : 'manager';
-  const headers = {
-    'Content-Type': 'application/json',
-    'x-user-role': role,
-    ...(options.headers || {})
-  };
+export const API_BASE = (process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000").replace(/\/$/, "");
 
-  const res = await fetch(`${API_BASE}${endpoint}`, {
-    ...options,
-    headers
+async function call<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    ...init,
+    headers: { "content-type": "application/json", ...(init?.headers || {}) },
+    cache: "no-store",
+    signal: init?.signal ?? AbortSignal.timeout(8000), // a hung request must never freeze the dashboard
   });
-
-  if (!res.ok) {
-    const errorBody = await res.json().catch(() => ({}));
-    throw new Error(errorBody.detail || `API request failed with status ${res.status}`);
-  }
-
-  return res.json();
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error((body as { error?: string }).error || `Request failed (${res.status})`);
+  return body as T;
 }
+
+export const getState = () => call<CampusState>("/state");
+export const getIncident = (id: string) => call<Incident>(`/incidents/${id}`);
+export const getHistory = (id: string, minutes = 30) =>
+  call<{ readings: HistoryPoint[] }>(`/buildings/${id}/history?minutes=${minutes}`).then((r) => r.readings);
+export const runScenario = (type: ScenarioKind, building_id: string) =>
+  call<CampusState>("/scenario", { method: "POST", body: JSON.stringify({ type, building_id }) });
+export const resetCampus = () => call<CampusState>("/scenario/reset", { method: "POST", body: "{}" });
+export const sendReport = (building_id: string, text: string, category: string) =>
+  call("/reports", { method: "POST", body: JSON.stringify({ building_id, text, category }) });
