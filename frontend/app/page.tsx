@@ -110,7 +110,7 @@ export default function Home() {
           <div style={{ display: "flex", gap: "20px", alignItems: "center" }}>
             <Link href="/dashboard" style={{ color: "var(--mist)", transition: "color 0.2s" }}>Dashboard</Link>
             <Link href="/student" style={{ color: "var(--mist)", transition: "color 0.2s" }}>Student View</Link>
-            <a href="https://github.com" target="_blank" rel="noreferrer" style={{ color: "var(--lagoon)", textDecoration: "none" }}>GitHub ↗</a>
+            <a href="https://github.com/ggaurrii/AquaOps" target="_blank" rel="noreferrer" style={{ color: "var(--lagoon)", textDecoration: "none" }}>GitHub ↗</a>
           </div>
         </footer>
       </ScrollReveal>
